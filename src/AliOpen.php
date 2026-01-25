@@ -1,9 +1,9 @@
 <?php
-namespace usualtool\Ali;
+namespace usualtool\AliOpen;
 /**
  * 通用签名接口
  */
-class Sign{
+class AliOpen{
     var $appid;
     var $appkey;
     var $alikey;
@@ -155,4 +155,5 @@ class Sign{
         $node = str_replace(".", "_",$method) . "_response";
         return json_encode($output[$node]);
     }
+
 }
