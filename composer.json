@@ -1,6 +1,6 @@
 {
     "name":             "usualtool/ut-ali",
-    "description":      "UT framework extension:Oauth 2.0.",
+    "description":      "UT framework extension:Ali.",
     "keywords":         ["ut-ali", "usualtool", "UT Framework"],
     "homepage":         "https://github.com/usualtool",
     "license": "Apache-2.0",
@@ -14,4 +14,5 @@
             "usualtool\\Ali\\": "src"
         }
     }
+
 }
