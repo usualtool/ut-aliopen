@@ -15,15 +15,22 @@ class AliOpen{
         $this->appline=$appline;
     }
     public function AddSign($data,$type='RSA2') {
-        $search = [
-            "-----BEGIN RSA PRIVATE KEY-----",
-            "-----END RSA PRIVATE KEY-----",
-            "\n",
-            "\r",
-            "\r\n"
-        ];
-        $private_key=str_replace($search,"",$this->appkey);
-        $private_key=$search[0] . PHP_EOL . wordwrap($private_key, 64, "\n", true) . PHP_EOL . $search[1];
+        $src=(string)$this->appkey;
+        if(trim($src)===""){
+            throw new \RuntimeException('支付宝应用私钥为空');
+        }
+        if(strpos($src,'PRIVATE KEY')===false){
+            $der=base64_decode(preg_replace('/\s+/','',$src));
+            $isPkcs8 = (substr($der,7,3)==="30\x0d\x06");
+            $begin = $isPkcs8 ? '-----BEGIN PRIVATE KEY-----' : '-----BEGIN RSA PRIVATE KEY-----';
+            $end   = $isPkcs8 ? '-----END PRIVATE KEY-----' : '-----END RSA PRIVATE KEY-----';
+            $src=$begin.$src.$end;
+        }
+        $isPkcs8 = strpos($src,'BEGIN PRIVATE KEY')!==false;
+        $begin = $isPkcs8 ? '-----BEGIN PRIVATE KEY-----' : '-----BEGIN RSA PRIVATE KEY-----';
+        $end   = $isPkcs8 ? '-----END PRIVATE KEY-----' : '-----END RSA PRIVATE KEY-----';
+        $body=str_replace(array($begin,$end,"\n","\r"," ","\t"),'',$src);
+        $private_key=$begin . PHP_EOL . wordwrap($body, 64, "\n", true) . PHP_EOL . $end;
         $res=openssl_get_privatekey($private_key);
         if($res){
             if($type == 'RSA'){
@@ -31,9 +38,8 @@ class AliOpen{
             }elseif($type == 'RSA2'){
                 openssl_sign($data, $sign,$res,OPENSSL_ALGO_SHA256);
             }
-            openssl_free_key($res);
         }else {
-            exit("私钥格式有误");
+            throw new \RuntimeException('支付宝应用私钥格式有误（PEM 或裸 base64 均无法解析）');
         }
         $sign = base64_encode($sign);
         return $sign;
@@ -55,9 +61,8 @@ class AliOpen{
             }elseif($type == 'RSA2'){
                 $result = (bool)openssl_verify($data, base64_decode($sign), $res,OPENSSL_ALGO_SHA256);
             }
-            openssl_free_key($res);
         }else{
-            exit("公钥格式有误");
+            throw new \RuntimeException('支付宝公钥格式有误（配置里填的不是 PEM 公钥）');
         }
         return $result;
     }
@@ -134,26 +139,90 @@ class AliOpen{
             return false;
         }
     }
-    public function ApiRequest($method,$bizstr){
-        $sign=urlencode($this->GetRsa2Sign($this->GetPin($method,$bizstr)));
-        if(is_array($bizstr)){
-            $pastr=$this->GetStr($this->GetPin($method,$bizstr))."&sign=".$sign;
-        }else{
-            $pastr=$this->GetStr($this->GetPin($method,$bizstr,1))."&sign=".$sign;
+    /**
+     * 授权码换访问令牌
+     */
+    public function GetOauthToken($code){
+        $out=json_decode($this->ApiRequest("alipay.system.oauth.token",array("grant_type"=>"authorization_code","code"=>$code)),true);
+        if(isset($out["code"]) && empty($out["access_token"])){
+            throw new \RuntimeException($out["sub_msg"] ?? ($out["msg"] ?? "支付宝网关返回错误"));
         }
+        return $out;
+    }
+    /**
+     * 访问令牌取会员信息
+     */
+    public function GetUserInfo($accessToken){
+        $out=json_decode($this->ApiRequest("alipay.user.info.share",array("auth_token"=>$accessToken)),true);
+        if(isset($out["code"]) && empty($out["user_id"]) && empty($out["open_id"])){
+            throw new \RuntimeException("换取用户信息失败：".($out["sub_msg"] ?? ($out["msg"] ?? "网关未返回用户标识")));
+        }
+        if(empty($out["user_id"]) && !empty($out["open_id"])){
+            $out["user_id"]=$out["open_id"];
+        }
+        return $out;
+    }
+    /**
+     * 授权码换用户标识
+     */
+    public function GetUser($code){
+        $token=$this->GetOauthToken($code);
+        if(!empty($token["user_id"])){
+            $token["source"]="oauth";
+            return $token;
+        }
+        if(empty($token["access_token"])){
+            throw new \RuntimeException("oauth.token 未返回 access_token/user_id，返回键：".implode(",",array_keys($token)));
+        }
+        $info=$this->GetUserInfo($token["access_token"]);
+        $info["access_token"]=$token["access_token"];
+        return $info;
+    }
+    public function ApiRequest($method,$bizstr){
+        if(is_array($bizstr)){
+            $params=$this->GetPin($method,$bizstr);
+        }else{
+            $params=$this->GetPin($method,$bizstr,1);
+            $params["biz_content"]=urldecode($params["biz_content"]);
+        }
+        $sign=$this->AddSign($this->GetStr($params),'RSA2');
+        $params["sign"]=$sign;
+        $pairs=array();
+        foreach($params as $k=>$v){
+            $pairs[]=rawurlencode($k)."=".rawurlencode((string)$v);
+        }
+        $pastr=implode("&",$pairs);
         $curl = curl_init();
         $header = array('content-type:application/x-www-form-urlencoded;charset=utf-8');
-        curl_setopt($ch,CURLOPT_HTTPHEADER,$header);
+        curl_setopt($curl,CURLOPT_HTTPHEADER,$header);
         curl_setopt($curl, CURLOPT_URL, $this->appline);
         curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, FALSE);
         curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, FALSE);
         curl_setopt($curl, CURLOPT_POST, 1);
         curl_setopt($curl, CURLOPT_POSTFIELDS,$pastr);
         curl_setopt($curl, CURLOPT_RETURNTRANSFER, TRUE);
-        $output = json_decode(curl_exec($curl),true);
-        curl_close($curl);
+        curl_setopt($curl, CURLOPT_TIMEOUT, 15);
+        $raw = curl_exec($curl);
+        $errno = curl_errno($curl);
+        $error = curl_error($curl);
+        if(PHP_VERSION_ID<80000){
+            curl_close($curl);
+        }
+        if($errno){
+            throw new \RuntimeException('请求支付宝网关失败：'.$error);
+        }
+        $output = json_decode($raw,true);
+        if(is_array($output) && isset($output['error_response'])){
+            return json_encode($output['error_response']);
+        }
         $node = str_replace(".", "_",$method) . "_response";
+        if(!is_array($output) || !isset($output[$node])){
+            $snippet = function_exists('mb_substr') ? mb_substr((string)$raw,0,200) : substr((string)$raw,0,200);
+            if(!preg_match('//u',$snippet)){
+                $snippet = bin2hex(substr((string)$raw,0,60));
+            }
+            throw new \RuntimeException('支付宝网关返回异常：'.$snippet);
+        }
         return json_encode($output[$node]);
     }
-
 }
